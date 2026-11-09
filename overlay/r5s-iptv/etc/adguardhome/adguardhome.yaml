@@ -1,0 +1,135 @@
+# ===========================================================================
+#  AdGuard Home 预置配置 —— NanoPi R5S IPTV 旁路由
+#
+#  字段结构严格对照 AdGuardHome v0.107.80 的 schema_version 34
+#  （internal/configmigrate/testdata/TestMigrateConfig_Migrate/v34/output.yml），
+#  这样启动时不会触发迁移器改写本文件。
+#
+#  权限说明：
+#    /etc/adguardhome 目录必须是 0700 且属主 adguardhome:adguardhome，
+#    首启脚本 /etc/uci-defaults/99-r5s-iptv 会做 chmod/chown。
+#    AdGuardHome 跑在 procd jail 里，靠 /etc/capabilities/adguardhome.json
+#    取得绑定 53 端口的能力，非 root 也能监听。
+#
+#  ⚠️ 默认管理账号 admin / password，刷机后第一件事就是改掉。
+# ===========================================================================
+
+http:
+  # 管理页监听所有接口。eth2 是 DHCP 客户端、IP 会变，
+  # 所以不能绑死地址；访问面由防火墙控制（专网侧 80/443 已 REJECT）。
+  address: 0.0.0.0:3000
+  session_ttl: 720h
+  pprof:
+    enabled: false
+    port: 6060
+
+users:
+- name: admin
+  # bcrypt(password)，cost 10。改密码请直接在 Web 管理页里改，
+  # 不要手改这行 —— AGH 写入时会用新的哈希覆盖整个文件。
+  password: $2a$10$bx3vdYtTci/AlYMjmT/Re.iLSrHkZpYdQ2GcZuCUw8/5EnhTnTo5q
+
+dns:
+  # 同理，eth2 地址不固定，必须绑 0.0.0.0；
+  # "DNS 只服务 eth2 侧" 由防火墙规则保证：
+  #   Block-DNS-from-lan210  (lan210 -> 53/853/8853 REJECT)
+  #   Block-DNS-from-iptv    (iptv   -> 53/853/8853 REJECT)
+  bind_hosts:
+  - 0.0.0.0
+  port: 53
+  upstream_dns:
+  - 223.5.5.5
+  - 119.29.29.29
+  - https://dns.alidns.com/dns-query
+  - https://doh.pub/dns-query
+  bootstrap_dns:
+  - 223.5.5.5
+  - 119.29.29.29
+  cache_enabled: true
+  cache_size: 4194304
+  cache_optimistic_answer_ttl: 30s
+  cache_optimistic_max_age: 12h
+  edns_client_subnet:
+    enabled: false
+    use_custom: false
+    custom_ip: ""
+
+filtering:
+  filtering_enabled: true
+  protection_enabled: true
+  parental_enabled: false
+  safebrowsing_enabled: false
+  blocked_response_ttl: 10
+  rewrites: []
+  safe_fs_patterns: []
+  safe_search:
+    enabled: false
+    bing: true
+    duckduckgo: true
+    google: true
+    pixabay: true
+    yandex: true
+    youtube: true
+  blocked_services:
+    schedule:
+      time_zone: Local
+    ids: []
+
+# 只放一条国内可直连的规则；AdGuard 官方那条走 GitHub Pages，
+# 电信 163 骨干下经常超时，默认关掉，需要时自己在 Web 里打开。
+filters:
+- url: https://anti-ad.net/easylist.txt
+  name: anti-AD
+  enabled: true
+- url: https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt
+  name: AdGuard DNS filter
+  enabled: false
+
+clients:
+  persistent: []
+  runtime_sources:
+    whois: true
+    arp: true
+    rdns: true
+    dhcp: true
+    hosts: true
+
+# R5S 不做 DHCP，地址由 UniFi 主路由发放
+dhcp:
+  enabled: false
+  interface_name: ""
+  local_domain_name: local
+
+tls:
+  enabled: false
+
+user_rules: []
+
+# work_dir 在 /var/lib/adguardhome（tmpfs），所以日志和统计都别留太久。
+# 想持久化到 256G M.2：把 work_dir 改成 /opt/adguardhome，
+# 并在 /etc/config/adguardhome 里加  list jail_mount_rw '/opt/adguardhome'
+# （AGH 在 procd jail 内，没挂进去的路径它看不见）。
+querylog:
+  enabled: true
+  file_enabled: true
+  interval: 24h
+  size_memory: 1000
+  ignored: []
+  ignored_enabled: false
+
+statistics:
+  enabled: true
+  interval: 24h
+  ignored: []
+  ignored_enabled: false
+
+log:
+  file: ""
+  max_backups: 0
+  max_size: 100
+  max_age: 3
+  compress: true
+  local_time: true
+  verbose: false
+
+schema_version: 34

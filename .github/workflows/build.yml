@@ -1,9 +1,31 @@
 name: Build FriendlyWrt
 
+# ---------------------------------------------------------------------------
+# 本文件基于 friendlyarm/Actions-FriendlyWrt master 分支的 build.yml 修改。
+# 相对上游的三处改动：
+#   1) 矩阵裁剪为 VERSION=25.12 / SET=non-docker / CPU=rk3568（NanoPi R5S/R5C），
+#      把 32 个 job 降到 2 个，避免免费额度与排队时间浪费。
+#   2) build_img 增加两个 step：下载 Caddy 官方 linux/arm64 静态二进制、
+#      把仓库根目录的 overlay/r5s-iptv 拷进 project/device/common/r5s-iptv，
+#      并向 .current_config.mk 追加 FRIENDLYWRT_FILES，使 build.sh 把这些文件
+#      rsync 进 rootfs（FRIENDLYWRT_FILES 机制只在 sd-img 阶段生效）。
+#   3) 上传步骤增加 sha256sums.txt，便于刷机前校验。
+# 其余内容与上游保持一致，方便日后 diff 跟进。
+# ---------------------------------------------------------------------------
+
 on:
-  workflow_dispatch:
   watch:
     types: started
+
+env:
+  FW_VERSION: '25.12'
+  FW_CPU: 'rk3568'
+  # 升级前先确认 https://github.com/caddyserver/caddy/releases 上有对应的
+  # caddy_<VER>_linux_arm64.tar.gz 与 caddy_<VER>_checksums.txt 两个资产。
+  # 2026-11-10 实测：v2.11.9 两个资产都在，二进制为
+  #   ELF 64-bit LSB executable, ARM aarch64, statically linked, Go, stripped
+  CADDY_VERSION: '2.11.9'
+
 jobs:
   prepare_release:
     runs-on: ubuntu-22.04
@@ -12,7 +34,7 @@ jobs:
     - name: Get release tag
       id: release_tag
       run: |
-        release_tag="FriendlyWrt-$(date +%Y-%m-%d)"
+        release_tag="FriendlyWrt-R5S-IPTV-$(date +%Y-%m-%d)"
         echo "release_tag=$release_tag" >> $GITHUB_OUTPUT
 
     - name: Create empty release
@@ -34,8 +56,8 @@ jobs:
     if: github.event.repository.owner.id == github.event.sender.id
     strategy:
       matrix:
-        VERSION: ['25.12', '24.10']
-        SET: [docker, non-docker]
+        VERSION: ['25.12']
+        SET: [non-docker]
 
     steps:
     - name: Checkout
@@ -95,134 +117,43 @@ jobs:
         EOL
         DEBUG_DOT_CONFIG=1 ./build.sh friendlywrt
 
+    - name: Verify customizations survived defconfig
+      run: |
+        cd project/friendlywrt
+        echo "===== 校验关键包是否真的进入了 .config ====="
+        fail=0
+        for sym in \
+            CONFIG_PACKAGE_rtp2httpd \
+            CONFIG_PACKAGE_luci-app-rtp2httpd \
+            CONFIG_PACKAGE_adguardhome \
+            CONFIG_PACKAGE_luci-app-adguardhome \
+            CONFIG_PACKAGE_chrony \
+            CONFIG_PACKAGE_luci-app-chrony \
+            CONFIG_PACKAGE_luci-theme-argon \
+            CONFIG_PACKAGE_ppp \
+            CONFIG_PACKAGE_ppp-mod-pppoe \
+            CONFIG_PACKAGE_kmod-nvme ; do
+          if grep -qx "${sym}=y" .config; then
+            echo "  OK   ${sym}"
+          else
+            echo "  MISS ${sym}"
+            fail=1
+          fi
+        done
+        echo "----- rtp2httpd feed 是否被 feeds 识别 -----"
+        ls -d feeds/rtp2httpd || { echo "  MISS feeds/rtp2httpd"; fail=1; }
+        ls feeds/rtp2httpd/openwrt-support 2>/dev/null || true
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::部分自定义包未进入 .config，请检查 configs/rockchip/06-r5s-iptv 与 feeds.conf.default"
+          exit 1
+        fi
+
     - name: Download package
       run: |
         cd project/friendlywrt
         make download -j8
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
-
-    - name: Inject Custom Feeds, Argon Theme, Python3 and Bypass Config
-      run: |
-          # 寻找源码中的 friendlywrt 目录
-          [ -d "friendlywrt-rk3568/friendlywrt" ] && cd friendlywrt-rk3568/friendlywrt || cd friendlywrt
-
-          # 1. 引入 stackia/rtp2httpd 官方软件源
-          echo "src-git rtp2httpd https://github.com/stackia/rtp2httpd.git" >> feeds.conf.default
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
-
-          # 2. 拉取最新版本的 Argon 主题及其配套管理插件 (luci-app-argon-config)
-          rm -rf package/feeds/luci/luci-theme-argon package/downloads/luci-theme-argon 2>/dev/null || true
-          git clone -b master --depth 1 https://github.com/jerrykuku/luci-theme-argon.git package/downloads/luci-theme-argon
-          git clone -b master --depth 1 https://github.com/jerrykuku/luci-app-argon-config.git package/downloads/luci-app-argon-config
-
-          # 3. 将系统的默认主题直接切换为 Argon
-          sed -i 's/luci-theme-bootstrap/luci-theme-argon/' feeds/luci/collections/luci/Makefile 2>/dev/null || true
-
-          # 4. 追加旁路由核心服务、Argon 主题与完整 Python 3 环境到 .config
-          cat >> .config << 'EOF'
-          # --- Argon 现代化毛玻璃主题与设置插件 ---
-          CONFIG_PACKAGE_luci-theme-argon=y
-          CONFIG_PACKAGE_luci-app-argon-config=y
-          CONFIG_PACKAGE_luci-i18n-argon-config-zh-cn=y
-
-          # --- 千兆口 IPTV PPPoE 拨号与 rtp2httpd 组播转单播 ---
-          CONFIG_PACKAGE_rtp2httpd=y
-          CONFIG_PACKAGE_luci-app-rtp2httpd=y
-          CONFIG_PACKAGE_luci-i18n-rtp2httpd-zh-cn=y
-          CONFIG_PACKAGE_ppp-mod-pppoe=y
-          CONFIG_PACKAGE_kmod-pppoe=y
-          CONFIG_PACKAGE_igmpproxy=y
-          CONFIG_PACKAGE_tcpdump=y
-
-          # --- AdGuard Home 广告过滤与 DNS 分流 ---
-          CONFIG_PACKAGE_adguardhome=y
-          CONFIG_PACKAGE_luci-app-adguardhome=y
-          CONFIG_PACKAGE_luci-i18n-adguardhome-zh-cn=y
-
-          # --- Caddy 反向代理与 chrony 高精度 NTP 时间服务 ---
-          CONFIG_PACKAGE_caddy=y
-          CONFIG_PACKAGE_chrony=y
-          # CONFIG_BUSYBOX_CONFIG_NTPD is not set
-
-          # --- 完整 Python 3 运行环境与常用库 ---
-          CONFIG_PACKAGE_python3=y
-          CONFIG_PACKAGE_python3-pip=y
-          CONFIG_PACKAGE_python3-requests=y
-          CONFIG_PACKAGE_python3-urllib3=y
-          CONFIG_PACKAGE_python3-certifi=y
-          CONFIG_PACKAGE_python3-chardet=y
-          CONFIG_PACKAGE_python3-idna=y
-          CONFIG_PACKAGE_python3-bs4=y
-          CONFIG_PACKAGE_python3-lxml=y
-          CONFIG_PACKAGE_python3-yaml=y
-          CONFIG_PACKAGE_python3-cryptodomex=y
-          CONFIG_PACKAGE_python3-asyncio=y
-
-          # --- 基础管理与远程终端工具 ---
-          CONFIG_PACKAGE_curl=y
-          CONFIG_PACKAGE_jq=y
-          CONFIG_PACKAGE_bash=y
-          CONFIG_PACKAGE_ca-bundle=y
-          CONFIG_PACKAGE_ca-certificates=y
-          CONFIG_PACKAGE_openssh-sftp-server=y
-          CONFIG_PACKAGE_luci-app-ttyd=y
-          EOF
-
-          # 5. 注入旁路由网口 DHCP 客户端预设脚本 (uci-defaults)
-          mkdir -p files/etc/uci-defaults files/root/scripts files/etc/caddy
-          cat > files/etc/uci-defaults/99-r5s-bypass-network << 'EOF'
-          #!/bin/sh
-          # 解除默认 br-lan 桥接，拆分三个物理网口
-          uci -q delete network.@device[0]
-          uci -q delete network.wan6
-
-          # 千兆口 (eth0)：编译预设为 DHCP 客户端（进后台后改为 IPTV PPPoE 拨号）
-          uci set network.wan=interface
-          uci set network.wan.device='eth0'
-          uci set network.wan.proto='dhcp'
-
-          # 2.5G 口 1 (eth1 - LAN1)：编译预设为 DHCP 客户端（接主路由看电视直播 + 管理）
-          uci set network.wan2=interface
-          uci set network.wan2.device='eth1'
-          uci set network.wan2.proto='dhcp'
-
-          # 2.5G 口 2 (eth2 - LAN2)：服务口（默认保留 192.168.2.1 防失联，如需出厂即 DHCP 可将 static 改为 dhcp）
-          uci set network.lan=interface
-          uci set network.lan.device='eth2'
-          uci set network.lan.proto='static'
-          uci set network.lan.ipaddr='192.168.0.5'
-          uci set network.lan.netmask='255.255.255.0'
-
-          # 关闭旁路由 DHCP Server 防止与主路由冲突
-          uci set dhcp.lan.ignore='1'
-          uci -q delete dhcp.lan.dhcpv6
-          uci -q delete dhcp.lan.ra
-
-          # 防火墙放行内网管理访问
-          uci set firewall.@zone[0].network='lan wan wan2'
-          uci set firewall.@zone[0].input='ACCEPT'
-          uci set firewall.@zone[0].output='ACCEPT'
-          uci set firewall.@zone[0].forward='ACCEPT'
-
-          # 强制系统首选主题路径为 Argon
-          uci set luci.main.mediaurlbase='/luci-static/argon'
-
-          uci commit network
-          uci commit dhcp
-          uci commit firewall
-          uci commit luci
-
-          # 启用 chrony 替代默认 sysntpd
-          /etc/init.d/sysntpd stop 2>/dev/null
-          /etc/init.d/sysntpd disable 2>/dev/null
-          /etc/init.d/chronyd enable 2>/dev/null
-          exit 0
-          EOF
-          chmod +x files/etc/uci-defaults/99-r5s-bypass-network
-
-          make defconfig
 
     - name: Compile friendlyWrt
       id: compile
@@ -310,9 +241,9 @@ jobs:
 
     strategy:
       matrix:
-        VERSION: ['25.12', '24.10']
-        CPU: [rk3328, rk3528, rk3399, rk3566, rk3568, rk3576, rk3588]
-        SET: [docker, non-docker]
+        VERSION: ['25.12']
+        CPU: [rk3568]
+        SET: [non-docker]
     steps:
     - name: Checkout
       uses: actions/checkout@v4
@@ -389,26 +320,8 @@ jobs:
       run: |
         cd project
         case ${{ matrix.CPU }} in
-        rk3328)
-          MODEL=R2S-R2C-Series
-          ;;
-        rk3528)
-          MODEL=R28S-Zero2-NEO3Plus-Series
-          ;;
-        rk3399)
-          MODEL=R4S-Series
-          ;;
         rk3568)
           MODEL=R5S-R5C-Series
-          ;;
-        rk3566)
-          MODEL=R3S-Series
-          ;;
-        rk3576)
-          MODEL=M5-R76S-Series
-          ;;
-        rk3588)
-          MODEL=T6-R6S-R6C-M6-Series
           ;;
         *)
           echo "unknow cpu"
@@ -432,6 +345,75 @@ jobs:
         echo "archive_filename=$TGZ_FILE" >> $GITHUB_OUTPUT
         echo "dist_dir=$DIST_DIR" >> $GITHUB_OUTPUT
         echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
+
+    # === 改动 2a：注入 R5S IPTV rootfs overlay =============================
+    # overlay/r5s-iptv 目录里的内容会被 build.sh rsync 进 rootfs（因为该目录
+    # 没有 install.sh）。同时把它注册到 FRIENDLYWRT_FILES 数组。
+    - name: Inject R5S IPTV rootfs overlay
+      run: |
+        set -e
+        if [ ! -d overlay/r5s-iptv ]; then
+          echo "::error::overlay/r5s-iptv 不存在，检查仓库根目录"
+          exit 1
+        fi
+        DEST=project/device/common/r5s-iptv
+        mkdir -p "${DEST}"
+        cp -a overlay/r5s-iptv/. "${DEST}/"
+        find "${DEST}" -type f \( -path '*/init.d/*' -o -path '*/uci-defaults/*' \) -exec chmod 0755 {} +
+        echo "FRIENDLYWRT_FILES+=(device/common/r5s-iptv)" >> project/.current_config.mk
+        echo "--- overlay 内容 ---"
+        find "${DEST}" -type f -printf '%M %10s  %p\n' | sort
+        echo "--- .current_config.mk ---"
+        cat project/.current_config.mk
+
+    # === 改动 2b：下载 Caddy 官方静态二进制 ================================
+    # Caddy 已从 openwrt/packages 移除，主流第三方 feed 亦无适配 25.x 的包，
+    # 因此直接取 caddyserver 官方 linux/arm64 静态二进制放入 rootfs。
+    #
+    # 🔴 坑：官方 caddy_<VER>_checksums.txt 用的是 SHA-512（128 位十六进制），
+    #    不是 SHA-256。用 sha256sum -c 会直接校验失败。下面按哈希长度自动选算法。
+    - name: Fetch Caddy static binary (linux/arm64)
+      run: |
+        set -e
+        VER="${CADDY_VERSION}"
+        TARBALL="caddy_${VER}_linux_arm64.tar.gz"
+        BASE="https://github.com/caddyserver/caddy/releases/download/v${VER}"
+        WORK="$(mktemp -d)"
+        cd "${WORK}"
+
+        curl -fSL --retry 5 --retry-delay 3 -o "${TARBALL}" "${BASE}/${TARBALL}"
+        curl -fSL --retry 5 --retry-delay 3 -o checksums.txt \
+             "${BASE}/caddy_${VER}_checksums.txt"
+
+        echo "--- 校验哈希 ---"
+        # 只匹配 " <空格><文件名><行尾>"，避免误配同名的 .deb / .sbom 行
+        grep " ${TARBALL}\$" checksums.txt > expected.txt
+        if [ ! -s expected.txt ]; then
+          echo "::error::checksums.txt 中找不到 ${TARBALL} 条目，检查 CADDY_VERSION 是否写错"
+          head -40 checksums.txt
+          exit 1
+        fi
+        HASH_LEN=$(awk '{print length($1)}' expected.txt)
+        case "${HASH_LEN}" in
+          64)  SUM=sha256sum ;;
+          128) SUM=sha512sum ;;
+          *)   echo "::error::无法识别的哈希长度 ${HASH_LEN}"; exit 1 ;;
+        esac
+        echo "使用 ${SUM}（哈希长度 ${HASH_LEN}）"
+        ${SUM} -c expected.txt
+
+        tar -xzf "${TARBALL}" caddy
+        file caddy || true
+        # 确认是静态链接的 arm64 ELF，避免把动态依赖带进 rootfs
+        ldd caddy 2>&1 | grep -q "not a dynamic executable" \
+          || { echo "::error::caddy 不是静态二进制，拒绝注入"; ldd caddy; exit 1; }
+
+        DEST="${GITHUB_WORKSPACE}/project/device/common/r5s-iptv/usr/bin"
+        mkdir -p "${DEST}"
+        install -m 0755 caddy "${DEST}/caddy"
+        echo "--- 注入结果 ---"
+        ls -l "${DEST}"
+        "${DEST}/caddy" version 2>/dev/null || echo "(arm64 二进制无法在 x86 runner 上执行，属正常)"
 
     - name: Unpack friendlywrt rootfs
       run: |
@@ -483,6 +465,22 @@ jobs:
         cd ../artifact/
         gzip *.img
 
+    # === 改动 3：附带校验和 =================================================
+    - name: Generate sha256sums
+      run: |
+        cd artifact
+        sha256sum *.gz > sha256sums.txt
+        cat sha256sums.txt
+
+    - name: Upload sha256sums to release
+      uses: svenstaro/upload-release-action@v2
+      with:
+        repo_token: ${{ secrets.GITHUB_TOKEN }}
+        file: ./artifact/sha256sums.txt
+        asset_name: sha256sums.txt
+        tag: ${{ needs.prepare_release.outputs.release_tag }}
+        overwrite: true
+
     - name: Upload images-XYZ.tgz to release
       uses: svenstaro/upload-release-action@v2
       with:
@@ -520,4 +518,3 @@ jobs:
             echo "Deleting asset: $asset"
             gh release delete-asset "$RELEASE_TAG" "$asset" --yes --repo "$GITHUB_REPOSITORY"
           done
-

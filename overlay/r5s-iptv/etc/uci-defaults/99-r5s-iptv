@@ -1,0 +1,369 @@
+#!/bin/sh
+# ===========================================================================
+#  /etc/uci-defaults/99-r5s-iptv
+#  NanoPi R5S (RK3568B2) —— IPTV 旁路由首次启动配置
+#
+#  注入方式：Actions-FriendlyWrt 的 FRIENDLYWRT_FILES(device/common/r5s-iptv)，
+#            build.sh 在 sd-img 阶段把整个目录 rsync 进 rootfs。
+#  执行时机：首次启动，晚于 preinit 的 board_detect / config_generate，
+#            因此可以安全改写 config_generate 刚生成的 /etc/config/network。
+#  执行后：  OpenWrt 的 uci-defaults 机制在脚本以 0 退出后自动删除本文件，
+#            所以整套配置只在首启生效一次，之后你手改的东西不会被覆盖。
+#
+#  ⚠️ 这里【不】预置 /etc/config/network 静态文件，是有意为之：
+#     bin/config_generate 开头有
+#         [ -s /etc/config/network -a -s /etc/config/system ] && exit 0
+#     一旦 rootfs 里已经带了 network 配置，board.d/02_network 里
+#     `macaddr_generate_from_mmc_cid mmcblk*` 派生出来的稳定 MAC 就不会被写进
+#     配置，网卡 MAC 会退化。所以必须让它先生成、我们后改写。
+# ===========================================================================
+
+[ -x /sbin/uci ] || exit 0
+
+TAG=r5s-iptv
+# 不用 `--`：busybox logger 的 getopt32 对 `--` 的处理各版本不一致，
+# 而下面的消息都不以 - 开头，本来也不需要它。
+say() { logger -t "$TAG" -s "$*"; }
+
+# --- 可调参数 ---------------------------------------------------------------
+IPTV_IF=iptv              # eth0 千兆口上的 PPPoE 专网接口名
+IPTV_DEV=eth0             # 若光猫输出带 VLAN 45 tag，改成 eth0.45（见 README）
+LAN_IF=lan210             # eth1 2.5G#1：IPTV 单播出流 + 设备管理
+LAN_DEV=eth1
+LAN_IP=192.168.210.3
+LAN_MASK=255.255.255.0
+MAIN_IF=mainlan           # eth2 2.5G#2：DHCP 客户端，接主内网，跑 DNS/NTP
+MAIN_DEV=eth2
+R2H_PORT=5140             # rtp2httpd 单播 HTTP 端口
+AGH_WEB_PORT=3000         # AdGuard Home 管理页端口
+IPTV_MCAST_ROUTES="10.0.0.0/8 224.0.0.0/4 124.232.0.0/16"
+
+say "开始配置 NanoPi R5S IPTV 旁路由"
+
+# /lib/functions/system.sh 提供 macaddr_add。
+# ⚠️ 必须先判存在再 source：POSIX sh 里 `.` 是特殊内建命令，文件找不到会
+#    直接终止整个非交互 shell（`|| true` 拦不住），那样本脚本会半途而废、
+#    又因为没以 0 退出而不被 uci-defaults 删除，导致每次开机重跑半套配置。
+if [ -f /lib/functions/system.sh ]; then
+    . /lib/functions/system.sh
+fi
+
+# ---------------------------------------------------------------------------
+# 1. 采集 config_generate 刚写入的 MAC 地址
+#    FriendlyWrt 的 board.d/02_network 对 friendlyelec,nanopi-r5s 做：
+#      ucidef_set_interface_wan 'eth0'
+#      ucidef_set_interface "lan" device "eth1 eth2" protocol "static" ipaddr "192.168.2.1"
+#      wan_mac=$(macaddr_generate_from_mmc_cid mmcblk*); lan_mac=$(macaddr_add "$wan_mac" 1)
+#    两个 lan 口会被 config_generate 合成 br-lan，MAC 挂在 device 段上。
+# ---------------------------------------------------------------------------
+WAN_MAC=$(uci -q get network.wan.macaddr)
+LAN_MAC=$(uci -q get network.br-lan.macaddr)
+[ -n "$LAN_MAC" ] || LAN_MAC=$(uci -q get network.lan.macaddr)
+[ -n "$WAN_MAC" ] || WAN_MAC=$(cat /sys/class/net/${IPTV_DEV}/address 2>/dev/null)
+[ -n "$LAN_MAC" ] || LAN_MAC=$(cat /sys/class/net/${LAN_DEV}/address 2>/dev/null)
+
+MAIN_MAC=""
+if [ -n "$LAN_MAC" ] && command -v macaddr_add >/dev/null 2>&1; then
+    MAIN_MAC=$(macaddr_add "$LAN_MAC" 1 2>/dev/null)
+fi
+[ -n "$MAIN_MAC" ] || MAIN_MAC=$(cat /sys/class/net/${MAIN_DEV}/address 2>/dev/null)
+
+say "MAC 采集 ${IPTV_DEV}=${WAN_MAC:-内核默认} ${LAN_DEV}=${LAN_MAC:-内核默认} ${MAIN_DEV}=${MAIN_MAC:-内核默认}"
+
+# ---------------------------------------------------------------------------
+# 2. 重建 /etc/config/network
+# ---------------------------------------------------------------------------
+uci -q delete network.wan6
+uci -q delete network.wan
+uci -q delete network.lan
+
+# 删除 br-lan 桥设备段。这一步是必须的：netifd 会独立实例化
+# /etc/config/network 里所有 device 段，留着 br-lan 就会把 eth1/eth2
+# 重新桥接在一起，「两个端口独立」就失效了。
+uci -q delete network.br-lan
+_i=0
+while [ $_i -lt 16 ] && uci -q delete 'network.@device[0]' 2>/dev/null; do
+    _i=$((_i + 1))
+done
+[ $_i -gt 0 ] && say "已删除 $_i 个匿名 device 段（含 br-lan 桥）"
+
+# --- eth0 千兆口：IPTV PPPoE 专网 -------------------------------------------
+# defaultroute=0 + peerdns=0 是关键：IPTV 拨号拿到的是 /32 私网地址，
+# 若让它注入默认路由或接管 DNS，会劫持整个主内网的上网流量。
+# auto=0：账号密码留在 LuCI 里填，避免空凭据反复重拨刷日志。
+uci -q batch <<EOF
+set network.${IPTV_IF}=interface
+set network.${IPTV_IF}.proto='pppoe'
+set network.${IPTV_IF}.device='${IPTV_DEV}'
+set network.${IPTV_IF}.username=''
+set network.${IPTV_IF}.password=''
+set network.${IPTV_IF}.ipv6='0'
+set network.${IPTV_IF}.mtu='1492'
+set network.${IPTV_IF}.auto='0'
+set network.${IPTV_IF}.defaultroute='0'
+set network.${IPTV_IF}.peerdns='0'
+EOF
+[ -n "$WAN_MAC" ] && uci -q set network.${IPTV_IF}.macaddr="$WAN_MAC"
+
+# --- eth1 2.5G#1：静态 192.168.210.3 ---------------------------------------
+uci -q batch <<EOF
+set network.${LAN_IF}=interface
+set network.${LAN_IF}.proto='static'
+set network.${LAN_IF}.device='${LAN_DEV}'
+set network.${LAN_IF}.ipaddr='${LAN_IP}'
+set network.${LAN_IF}.netmask='${LAN_MASK}'
+set network.${LAN_IF}.ipv6='0'
+EOF
+[ -n "$LAN_MAC" ] && uci -q set network.${LAN_IF}.macaddr="$LAN_MAC"
+
+# --- eth2 2.5G#2：DHCP 客户端接主内网 ---------------------------------------
+# 默认路由由这个接口带入，供 AdGuard Home 上游 DNS 与 chrony 上游 NTP 使用。
+uci -q batch <<EOF
+set network.${MAIN_IF}=interface
+set network.${MAIN_IF}.proto='dhcp'
+set network.${MAIN_IF}.device='${MAIN_DEV}'
+set network.${MAIN_IF}.ipv6='0'
+EOF
+[ -n "$MAIN_MAC" ] && uci -q set network.${MAIN_IF}.macaddr="$MAIN_MAC"
+
+# --- IPTV 专网静态路由 -------------------------------------------------------
+# 缺 10.0.0.0/8 时 EPG 请求会走默认路由出主内网 → 超时（历史实测 http=000）。
+for _t in ${IPTV_MCAST_ROUTES}; do
+    _n="route_iptv_$(echo "$_t" | tr './' '__')"
+    uci -q batch <<EOF
+set network.${_n}=route
+set network.${_n}.interface='${IPTV_IF}'
+set network.${_n}.target='${_t}'
+EOF
+done
+
+uci -q commit network
+say "network 已重建：${IPTV_DEV}=${IPTV_IF}(pppoe auto=0) ${LAN_DEV}=${LAN_IF}(${LAN_IP}) ${MAIN_DEV}=${MAIN_IF}(dhcp)"
+
+# ---------------------------------------------------------------------------
+# 3. 重建 /etc/config/firewall（fw4 / nftables）
+#
+#    ⚠️ iptv zone 的 input 必须是 ACCEPT，不能是 REJECT：
+#       rtp2httpd 是在路由器本机 bind UDP socket 收组播 RTP 的，这些流量属于
+#       input 而不是 forward。zone input REJECT 会直接把电视频道全挡掉。
+#       专网本身是电信 10.x 内网、由我们主动拨号接入，input ACCEPT 不构成风险；
+#       真正的隔离靠下面那几条针对本机的端口拒绝规则。
+#
+#    业务隔离目标（对应「不同的服务绑定不同端口」）：
+#      rtp2httpd 5140  -> 只给 lan210
+#      DNS 53/853/8853 -> 只给 mainlan
+#      NTP 123         -> 只给 mainlan
+#      LuCI 80/443     -> 只给 lan210 与 mainlan，专网侧拒绝
+# ---------------------------------------------------------------------------
+for _t in zone forwarding rule redirect; do
+    _i=0
+    while [ $_i -lt 32 ] && uci -q delete "firewall.@${_t}[0]" 2>/dev/null; do
+        _i=$((_i + 1))
+    done
+done
+
+_add_zone() { # name network input output forward masq
+    uci -q batch <<EOF
+add firewall zone
+set firewall.@zone[-1].name='$1'
+set firewall.@zone[-1].network='$2'
+set firewall.@zone[-1].input='$3'
+set firewall.@zone[-1].output='$4'
+set firewall.@zone[-1].forward='$5'
+set firewall.@zone[-1].masq='$6'
+set firewall.@zone[-1].mtu_fix='1'
+EOF
+}
+_add_zone "${LAN_IF}"  "${LAN_IF}"  ACCEPT ACCEPT ACCEPT 0
+_add_zone "${MAIN_IF}" "${MAIN_IF}" ACCEPT ACCEPT ACCEPT 0
+_add_zone "${IPTV_IF}" "${IPTV_IF}" ACCEPT ACCEPT REJECT 0
+
+# 不建任何 forwarding 规则：R5S 是旁路由，210 段和主内网的网关都是 UniFi，
+# 跨网段转发不该由它做（fw4 默认无 forwarding 即拒绝跨区转发）。
+
+# _reject_from <zone> <proto> <ports> <name>
+_reject_from() {
+    uci -q batch <<EOF
+add firewall rule
+set firewall.@rule[-1].name='$4'
+set firewall.@rule[-1].src='$1'
+set firewall.@rule[-1].proto='$2'
+set firewall.@rule[-1].dest_port='$3'
+set firewall.@rule[-1].target='REJECT'
+EOF
+}
+_reject_from "${MAIN_IF}" 'tcp'     "${R2H_PORT}"   'R2H-only-from-lan210'
+_reject_from "${IPTV_IF}" 'tcp'     "${R2H_PORT}"   'R2H-not-from-iptv'
+_reject_from "${LAN_IF}"  'tcp udp' '53 853 8853'   'Block-DNS-from-lan210'
+_reject_from "${IPTV_IF}" 'tcp udp' '53 853 8853'   'Block-DNS-from-iptv'
+_reject_from "${LAN_IF}"  'udp'     '123'           'Block-NTP-from-lan210'
+_reject_from "${IPTV_IF}" 'udp'     '123'           'Block-NTP-from-iptv'
+_reject_from "${IPTV_IF}" 'tcp'     '80 443 22'     'Block-mgmt-from-iptv'
+
+# 组播成员查询要能进来，否则 IGMP Join 收不到响应、组播流会断
+uci -q batch <<EOF
+add firewall rule
+set firewall.@rule[-1].name='Allow-IGMP-iptv'
+set firewall.@rule[-1].src='${IPTV_IF}'
+set firewall.@rule[-1].proto='igmp'
+set firewall.@rule[-1].target='ACCEPT'
+EOF
+
+uci -q commit firewall
+say "firewall 已重建：zone ${LAN_IF}/${MAIN_IF}/${IPTV_IF} + 端口级业务隔离"
+
+# ---------------------------------------------------------------------------
+# 4. dnsmasq：本机不做 DHCP、53 口交给 AdGuard Home
+#    dnsmasq-full 仍在镜像里（LuCI 网络模块要用它的配置界面），只是停用服务。
+#    应急时可 /etc/init.d/adguardhome stop && /etc/init.d/dnsmasq start
+# ---------------------------------------------------------------------------
+if [ -x /etc/init.d/dnsmasq ]; then
+    /etc/init.d/dnsmasq disable 2>/dev/null
+    /etc/init.d/dnsmasq stop 2>/dev/null
+    say "dnsmasq 已停用（本机不发 DHCP，53 口让给 AdGuard Home）"
+fi
+
+# ---------------------------------------------------------------------------
+# 5. chrony：NTP 服务器，只对 mainlan（eth2）侧提供服务
+#    chronyd.init 里 config_foreach handle_source server/pool、handle_allow allow，
+#    handle_allow 用 network_get_subnets 把接口名解析成实际网段写 `allow <subnet>`。
+#
+#    ⚠️ 已知副作用：handle_allow() 对「持有默认路由的接口」会直接输出
+#       `allow 0/0`（向全网提供 NTP）。本机默认路由正是走 mainlan，
+#       所以真正的访问控制由第 3 节的防火墙规则兜住。
+# ---------------------------------------------------------------------------
+if [ -x /etc/init.d/chronyd ]; then
+    uci -q delete chrony.@allow[0]
+    uci -q delete chrony.@pool[0]
+    uci -q batch <<EOF
+add chrony allow
+set chrony.@allow[-1].interface='${MAIN_IF}'
+add chrony pool
+set chrony.@pool[-1].hostname='ntp.aliyun.com'
+set chrony.@pool[-1].maxpoll='12'
+set chrony.@pool[-1].maxsources='4'
+set chrony.@pool[-1].iburst='1'
+set chrony.@pool[-1].prefer='0'
+add chrony server
+set chrony.@server[-1].hostname='ntp.ntsc.ac.cn'
+set chrony.@server[-1].maxpoll='12'
+set chrony.@server[-1].iburst='1'
+set chrony.@server[-1].prefer='0'
+EOF
+    uci -q commit chrony
+    /etc/init.d/chronyd enable 2>/dev/null
+    say "chrony 已配置：上游 ntp.aliyun.com / ntp.ntsc.ac.cn，服务面 ${MAIN_IF}"
+fi
+
+# 关掉 OpenWrt 自带的 sysntpd，否则它和 chrony 抢 123 端口
+uci -q set system.ntp.enabled='0'
+uci -q set system.@system[0].zonename='Asia/Shanghai'
+uci -q set system.@system[0].timezone='CST-8'
+uci -q set system.@system[0].hostname='R5S-IPTV'
+uci -q commit system
+[ -x /etc/init.d/sysntpd ] && /etc/init.d/sysntpd disable 2>/dev/null
+
+# ---------------------------------------------------------------------------
+# 6. rtp2httpd：组播转单播，只绑定在 lan210（eth1）上
+#    listen 支持 `IP:PORT` 形式；upstream_interface 接 OpenWrt 网络接口名。
+# ---------------------------------------------------------------------------
+if uci -q get rtp2httpd.@rtp2httpd[0] >/dev/null 2>&1; then
+    # 包自带的 /etc/config/rtp2httpd 里 listen 是注释掉的，直接 delete 整个
+    # option 再 add_list，避免和默认值叠加
+    uci -q delete rtp2httpd.@rtp2httpd[0].listen
+    uci -q batch <<EOF
+set rtp2httpd.@rtp2httpd[0].disabled='0'
+set rtp2httpd.@rtp2httpd[0].respawn='1'
+set rtp2httpd.@rtp2httpd[0].upstream_interface='${IPTV_IF}'
+set rtp2httpd.@rtp2httpd[0].maxclients='4'
+set rtp2httpd.@rtp2httpd[0].udp_rcvbuf_size='524288'
+add_list rtp2httpd.@rtp2httpd[0].listen='${LAN_IP}:${R2H_PORT}'
+EOF
+    # 频道清单需要你自己导入（LuCI -> 服务 -> rtp2httpd，或用 external_m3u）
+    uci -q commit rtp2httpd
+    [ -x /etc/init.d/rtp2httpd ] && /etc/init.d/rtp2httpd enable 2>/dev/null
+    say "rtp2httpd 已配置：监听 ${LAN_IP}:${R2H_PORT}，上游接口 ${IPTV_IF}"
+else
+    say "警告：未找到 rtp2httpd 的 UCI 段，说明包没编进去，请查构建日志 Verify step"
+fi
+
+# ---------------------------------------------------------------------------
+# 7. AdGuard Home
+#    /etc/adguardhome/adguardhome.yaml 由 overlay 直接放进 rootfs。
+#    init 脚本会 mkdir -m 0700 并 chown 给 adguardhome 用户，但 overlay 里的
+#    文件属主是 root，这里先把权限理顺，避免首启失败。
+#    AGH 跑在 procd jail 里，靠 /etc/capabilities/adguardhome.json 拿到绑定
+#    53 端口的能力，所以非 root 用户也能监听 53。
+# ---------------------------------------------------------------------------
+if [ -d /etc/adguardhome ]; then
+    chmod 0700 /etc/adguardhome
+    id adguardhome >/dev/null 2>&1 && chown -R adguardhome:adguardhome /etc/adguardhome
+fi
+mkdir -p /var/lib/adguardhome
+chmod 0700 /var/lib/adguardhome
+id adguardhome >/dev/null 2>&1 && chown -R adguardhome:adguardhome /var/lib/adguardhome
+[ -x /etc/init.d/adguardhome ] && /etc/init.d/adguardhome enable 2>/dev/null
+say "AdGuard Home 已就绪：DNS 0.0.0.0:53，管理页 :${AGH_WEB_PORT}（默认 admin/password，务必修改）"
+
+# ---------------------------------------------------------------------------
+# 8. Caddy：二进制与 init 脚本已由 overlay 注入，按要求「只装不配」。
+#    Caddyfile 是空的；init 里用了 procd_set_param file，日后改 Caddyfile
+#    会自动重启，不用手动 reload。
+# ---------------------------------------------------------------------------
+if [ -x /etc/init.d/caddy ]; then
+    chmod 0755 /etc/init.d/caddy
+    mkdir -p /etc/caddy/data
+    /etc/init.d/caddy enable 2>/dev/null
+    say "Caddy 已安装（/usr/bin/caddy + 空 /etc/caddy/Caddyfile）"
+else
+    say "警告：/etc/init.d/caddy 不存在"
+fi
+[ -x /usr/bin/caddy ] || say "警告：/usr/bin/caddy 不存在，检查 build.yml 的 Fetch Caddy step"
+
+# ---------------------------------------------------------------------------
+# 9. sysctl：组播接收缓冲 + 放宽专网侧反向路径校验
+# ---------------------------------------------------------------------------
+cat > /etc/sysctl.d/99-r5s-iptv.conf <<'SYSCTL_EOF'
+# IPTV 组播转单播：放大 UDP 接收缓冲上限，避免高码率频道丢包
+net.core.rmem_max = 8388608
+net.core.rmem_default = 524288
+net.core.wmem_max = 8388608
+# IPTV 专网会收到大量源地址不在路由表里的组播包，放宽反向路径校验
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.default.rp_filter = 0
+SYSCTL_EOF
+sysctl -q -p /etc/sysctl.d/99-r5s-iptv.conf 2>/dev/null
+
+# ---------------------------------------------------------------------------
+# 10. 首启待办清单（也会打进 logread）
+# ---------------------------------------------------------------------------
+MAIN_MAC_NOW=$(cat /sys/class/net/${MAIN_DEV}/address 2>/dev/null || echo '见 LuCI 概览')
+cat > /etc/banner.iptv <<BANNER_EOF
+
+  ===== NanoPi R5S IPTV 旁路由 =====
+
+  网口分工：
+    eth0  千兆口   -> ${IPTV_IF}     PPPoE IPTV 专网（auto=0，未拨号）
+    eth1  2.5G #1  -> ${LAN_IF}    静态 ${LAN_IP}   单播出流 + 设备管理
+    eth2  2.5G #2  -> ${MAIN_IF}   DHCP 客户端     DNS / NTP 服务口
+
+  待办：
+    1) LuCI -> 网络 -> 接口 -> ${IPTV_IF} -> 编辑，填 IPTV 账号密码，
+       勾上「启动接口」，或直接：
+           uci set network.${IPTV_IF}.username='你的IPTV账号'
+           uci set network.${IPTV_IF}.password='你的密码'
+           uci set network.${IPTV_IF}.auto='1'
+           uci commit network && ifup ${IPTV_IF}
+    2) 改 root 密码：passwd
+    3) 改 AdGuard Home 密码：http://<eth2 的 IP>:${AGH_WEB_PORT}  (admin / password)
+    4) 去 UniFi 给 eth2 的 MAC ${MAIN_MAC_NOW} 做 DHCP 静态保留，
+       否则重启换 IP 后全网 DNS 会断
+    5) 导入 IPTV 频道清单到 rtp2httpd
+
+BANNER_EOF
+say "待办清单已写入 /etc/banner.iptv"
+say "配置完成，本脚本将被 uci-defaults 机制删除"
+
+# uci-defaults 在 /etc/init.d/boot(START=10) 里跑，早于 network(START=20)，
+# 所以不需要 reload，netifd 起来时读到的就是新配置。
+exit 0

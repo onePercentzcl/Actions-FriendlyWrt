@@ -1,0 +1,47 @@
+# ===========================================================================
+#  Caddyfile —— 按你的要求「只装不配」，出厂为空
+#
+#  Caddy 二进制在 /usr/bin/caddy（官方 linux/arm64 静态发布包，CI 构建时下载并
+#  做 SHA256 校验），init 脚本在 /etc/init.d/caddy，服务默认已 enable。
+#  空 Caddyfile 下 Caddy 只开一个 127.0.0.1:2019 的 admin 接口，不监听任何业务端口。
+#
+#  改完这个文件不用手动 reload：init 脚本里有 procd_set_param file，
+#  procd 会自动重启实例。手动重载用 /etc/init.d/caddy reload（平滑，不断连接）。
+#
+#  证书数据在 /etc/caddy/data/caddy（持久化在 rootfs 上，重启不换 CA）。
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# 下面是一个把内网各服务收拢到一个 HTTPS 入口的示例，默认整段注释掉了。
+# 需要时取消注释，并按实际端口改。注意 tls internal 用的是 Caddy 自签 CA，
+# 客户端首次访问要手动信任（或把根证书 /etc/caddy/data/caddy/pki/authorities/local/root.crt
+# 分发到设备上）。
+# ---------------------------------------------------------------------------
+
+# {
+# 	# 内网使用，用 Caddy 自带的内部 CA 签证书，不走 Let's Encrypt
+# 	# （家里是电信 CGNAT，没有公网 IP，ACME HTTP-01/TLS-ALPN-01 都过不了）
+# 	tls internal
+# 	admin 127.0.0.1:2019
+# 	log {
+# 		output file /etc/caddy/data/access.log {
+# 			roll_size 10MiB
+# 			roll_keep 3
+# 		}
+# 	}
+# }
+#
+# # LuCI 管理页
+# https://r5s.lan {
+# 	reverse_proxy 127.0.0.1:80
+# }
+#
+# # rtp2httpd 的 Web 播放器 / 状态页（只监听在 192.168.210.3:5140）
+# https://iptv.lan {
+# 	reverse_proxy 192.168.210.3:5140
+# }
+#
+# # AdGuard Home 管理页
+# https://agh.lan {
+# 	reverse_proxy 127.0.0.1:3000
+# }
