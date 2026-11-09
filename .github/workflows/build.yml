@@ -14,6 +14,7 @@ name: Build FriendlyWrt
 # ---------------------------------------------------------------------------
 
 on:
+  workflow_dispatch:
   watch:
     types: started
 
