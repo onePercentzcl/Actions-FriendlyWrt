@@ -126,28 +126,12 @@ jobs:
         EOL
         DEBUG_DOT_CONFIG=1 ./build.sh friendlywrt
 
-    # === 改动：关掉 CONFIG_ALL_KMODS，给 6 小时上限腾出空间 ==================
-    # mk-friendlywrt.sh 会强制往 .config 追加 CONFIG_ALL_KMODS=y，它把几百个
-    # 内核模块全部编成包——2 核 runner 下这是最大的时间黑洞，也是上次构建
-    # 跑满 6 小时被取消的主因之一。
-    #
-    # 安全性：ALL_KMODS 只影响「编哪些 kmod 包」，不影响「往 rootfs 装哪些模块」。
-    # 真正安装的模块由设备 profile（nanopi-r5s）+ 06-r5s-iptv 里显式 =y 的
-    # kmod（nvme/pppoe/nft-* 等）决定，关掉 ALL_KMODS 后这些不受影响。
-    # 代价只是镜像里不再附带「全量 kmod 包仓库」，对一次性固件无所谓。
-    - name: Trim ALL_KMODS to fit the 6h job limit
-      run: |
-        cd project/friendlywrt
-        if grep -qx 'CONFIG_ALL_KMODS=y' .config; then
-          sed -i 's/^CONFIG_ALL_KMODS=y/# CONFIG_ALL_KMODS is not set/' .config
-          echo "已关闭 CONFIG_ALL_KMODS，重新 defconfig"
-          make defconfig
-        else
-          echo "CONFIG_ALL_KMODS 本就不在 .config 里，跳过"
-        fi
-        echo "--- 确认 ---"
-        grep -n 'CONFIG_ALL_KMODS' .config || echo "  (无 ALL_KMODS 行)"
-        grep -n 'CONFIG_ALL_NONSHARED' .config || true
+    # 注：这里【不】裁剪 CONFIG_ALL_KMODS。
+    # 曾尝试在 defconfig 后关掉它来省时间，但 ALL_KMODS 一关，make defconfig 会把我
+    # 显式选的 kmod 的「传递依赖」（kmod-nvme→hwmon-core→i2c-core、kmod-ppp→slhc→crc-ccitt、
+    # 以及 nft/br-netfilter/f2fs 等）一并丢掉，且不在 Verify 清单里的 kmod 会被静默丢弃、
+    # 运行时才炸。太脆。省时间的重任交给「AdGuardHome 改预编译二进制」（省约 1h Go 编译），
+    # 官方仓库带 ALL_KMODS 本就能在 6h 内编完，base 本身就 <6h，去掉 AGH 的 Go 编译应足够。
 
     - name: Verify customizations survived defconfig
       run: |
@@ -173,13 +157,6 @@ jobs:
             fail=1
           fi
         done
-        echo "----- 确认 ALL_KMODS 已关闭 -----"
-        if grep -qx 'CONFIG_ALL_KMODS=y' .config; then
-          echo "  MISS CONFIG_ALL_KMODS 仍然是 y，裁剪没生效"
-          fail=1
-        else
-          echo "  OK   CONFIG_ALL_KMODS 已关闭"
-        fi
         echo "----- rtp2httpd feed 是否被 feeds 识别 -----"
         ls -d feeds/rtp2httpd || { echo "  MISS feeds/rtp2httpd"; fail=1; }
         ls feeds/rtp2httpd/openwrt-support 2>/dev/null || true

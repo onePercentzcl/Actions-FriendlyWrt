@@ -63,11 +63,17 @@ cat > configs/rockchip/06-r5s-iptv <<'CONFIG_EOF'
 # ===========================================================================
 
 # ---- IPTV 专网 PPPoE（01-nanopi 里只有 ppp-mod-pppoa/pptp 等，缺 pppoe）----
+# 🔴 依赖链必须写全：关掉 ALL_KMODS 后，make defconfig 不会自动启用 `depends on`
+#    的传递依赖，缺一个就会把上层包连带丢掉（run #6 的 Verify 就是这么挂的）。
+#    链：ppp-mod-pppoe -> kmod-pppoe -> kmod-pppox -> kmod-ppp -> {kmod-slhc, kmod-lib-crc-ccitt}
+#        kmod-slhc -> kmod-lib-crc-ccitt
 CONFIG_PACKAGE_ppp=y
 CONFIG_PACKAGE_ppp-mod-pppoe=y
 CONFIG_PACKAGE_kmod-ppp=y
 CONFIG_PACKAGE_kmod-pppox=y
 CONFIG_PACKAGE_kmod-pppoe=y
+CONFIG_PACKAGE_kmod-slhc=y
+CONFIG_PACKAGE_kmod-lib-crc-ccitt=y
 CONFIG_PACKAGE_luci-proto-ppp=y
 
 # ---- rtp2httpd：组播转单播 ----
@@ -118,7 +124,11 @@ CONFIG_PACKAGE_luci-i18n-package-manager-zh-cn=y
 # 所以本文件里没有任何 caddy 相关的 CONFIG_ 符号。
 
 # ---- 256G M.2 NVMe ----
+# 依赖链：kmod-nvme -> kmod-hwmon-core -> kmod-i2c-core（叶子）
+# 同样要写全，否则关 ALL_KMODS 后 defconfig 会把 kmod-nvme 丢掉。
 CONFIG_PACKAGE_kmod-nvme=y
+CONFIG_PACKAGE_kmod-hwmon-core=y
+CONFIG_PACKAGE_kmod-i2c-core=y
 CONFIG_PACKAGE_kmod-fs-f2fs=y
 CONFIG_PACKAGE_f2fsck=y
 CONFIG_PACKAGE_e2fsprogs=y
