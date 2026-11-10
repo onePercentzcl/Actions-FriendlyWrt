@@ -75,8 +75,14 @@ CONFIG_PACKAGE_rtp2httpd=y
 CONFIG_PACKAGE_luci-app-rtp2httpd=y
 CONFIG_PACKAGE_luci-i18n-rtp2httpd-zh-cn=y
 
-# ---- AdGuard Home（官方 packages net/adguardhome v0.107.80，Go 源码编译）----
-CONFIG_PACKAGE_adguardhome=y
+# ---- AdGuard Home ----
+# 🔴 不编 adguardhome 本体（CONFIG_PACKAGE_adguardhome 故意不写）：
+#    它要现编 Go 工具链 + AGH 源码，2 核 runner 下约 1 小时，是把构建顶过
+#    GitHub 6 小时上限的元凶之一。改用官方预编译 arm64 二进制（自带前端），
+#    由 build.yml 的 "Fetch AdGuardHome static binary" step 注入 /usr/bin/AdGuardHome，
+#    运行时文件（init/config/capabilities/sysctl/uci-defaults）由 overlay 注入，
+#    版本对齐 0.107.80，保证下面这个 LuCI 应用兼容。
+# luci-app-adguardhome 是纯 LuCI（js + 翻译），不含 Go，编译很快，正常从 feed 编。
 CONFIG_PACKAGE_luci-app-adguardhome=y
 
 # ---- chrony NTP（官方 packages net/chrony）----

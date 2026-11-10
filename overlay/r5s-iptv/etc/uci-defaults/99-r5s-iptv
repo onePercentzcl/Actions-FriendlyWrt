@@ -289,20 +289,40 @@ fi
 
 # ---------------------------------------------------------------------------
 # 7. AdGuard Home
-#    /etc/adguardhome/adguardhome.yaml 由 overlay 直接放进 rootfs。
-#    init 脚本会 mkdir -m 0700 并 chown 给 adguardhome 用户，但 overlay 里的
-#    文件属主是 root，这里先把权限理顺，避免首启失败。
+#    二进制是 CI 下载的官方预编译 arm64 版（/usr/bin/AdGuardHome，自带前端），
+#    init/config/capabilities/sysctl/uci-defaults 五个运行时文件由 overlay 注入
+#    （取自 openwrt/packages net/adguardhome 的 files/，版本对齐 0.107.80）。
+#
+#    官方包靠 Makefile 里 `USERID:=adguardhome=853:adguardhome=853` 声明式建用户，
+#    现在我们不编这个包，所以这里手动建，uid/gid 严格对齐 853（capabilities 和
+#    文件属主都引用这个用户）。user_add/group_add 来自 /lib/functions.sh，
+#    uci_apply_defaults 已经 source 过（本脚本开头也再 source 一次 system.sh）。
+#
 #    AGH 跑在 procd jail 里，靠 /etc/capabilities/adguardhome.json 拿到绑定
 #    53 端口的能力，所以非 root 用户也能监听 53。
 # ---------------------------------------------------------------------------
+if ! id adguardhome >/dev/null 2>&1; then
+    if command -v group_add >/dev/null 2>&1 && command -v user_add >/dev/null 2>&1; then
+        group_add adguardhome 853
+        user_add adguardhome 853 853 'AdGuard Home' '/var/lib/adguardhome' '/bin/false'
+    else
+        # 兜底：/lib/functions.sh 没被 source 时（正常不会发生，uci_apply_defaults
+        # 一定会 source 它），直接按 user_add 的格式写 passwd/group/shadow。
+        echo "adguardhome:x:853:" >> /etc/group
+        echo "adguardhome:x:853:853:AdGuard Home:/var/lib/adguardhome:/bin/false" >> /etc/passwd
+        echo "adguardhome:x:0:0:99999:7:::" >> /etc/shadow
+    fi
+    say "已创建 adguardhome 用户（uid/gid 853）"
+fi
 if [ -d /etc/adguardhome ]; then
     chmod 0700 /etc/adguardhome
-    id adguardhome >/dev/null 2>&1 && chown -R adguardhome:adguardhome /etc/adguardhome
+    chown -R adguardhome:adguardhome /etc/adguardhome
 fi
 mkdir -p /var/lib/adguardhome
 chmod 0700 /var/lib/adguardhome
-id adguardhome >/dev/null 2>&1 && chown -R adguardhome:adguardhome /var/lib/adguardhome
+chown -R adguardhome:adguardhome /var/lib/adguardhome
 [ -x /etc/init.d/adguardhome ] && /etc/init.d/adguardhome enable 2>/dev/null
+[ -x /usr/bin/AdGuardHome ] || say "警告：/usr/bin/AdGuardHome 不存在，检查 build.yml 的 Fetch AdGuardHome step"
 say "AdGuard Home 已就绪：DNS 0.0.0.0:53，管理页 :${AGH_WEB_PORT}（默认 admin/password，务必修改）"
 
 # ---------------------------------------------------------------------------

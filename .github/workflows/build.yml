@@ -14,6 +14,8 @@ name: Build FriendlyWrt
 # ---------------------------------------------------------------------------
 
 on:
+  # workflow_dispatch：可在 Actions 页手动点「Run workflow」触发（不依赖 star）。
+  # watch/started：star 自己的 fork 也会自动触发。两种都保留。
   workflow_dispatch:
   watch:
     types: started
@@ -26,6 +28,12 @@ env:
   # 2026-11-10 实测：v2.11.9 两个资产都在，二进制为
   #   ELF 64-bit LSB executable, ARM aarch64, statically linked, Go, stripped
   CADDY_VERSION: '2.11.9'
+  # AdGuardHome 版本必须和 luci-app-adguardhome 期望的一致（0.107.80），
+  # 且与 openwrt/packages net/adguardhome 的 PKG_VERSION 对齐。
+  # 2026-11-10 实测：v0.107.80 的 AdGuardHome_linux_arm64.tar.gz 存在，
+  # checksums.txt 用 SHA-256（注意：和 Caddy 的 SHA-512 不同），文件名带 ./ 前缀，
+  # 二进制在包内 AdGuardHome/AdGuardHome 子目录，静态链接 aarch64。
+  AGH_VERSION: '0.107.80'
 
 jobs:
   prepare_release:
@@ -118,15 +126,39 @@ jobs:
         EOL
         DEBUG_DOT_CONFIG=1 ./build.sh friendlywrt
 
+    # === 改动：关掉 CONFIG_ALL_KMODS，给 6 小时上限腾出空间 ==================
+    # mk-friendlywrt.sh 会强制往 .config 追加 CONFIG_ALL_KMODS=y，它把几百个
+    # 内核模块全部编成包——2 核 runner 下这是最大的时间黑洞，也是上次构建
+    # 跑满 6 小时被取消的主因之一。
+    #
+    # 安全性：ALL_KMODS 只影响「编哪些 kmod 包」，不影响「往 rootfs 装哪些模块」。
+    # 真正安装的模块由设备 profile（nanopi-r5s）+ 06-r5s-iptv 里显式 =y 的
+    # kmod（nvme/pppoe/nft-* 等）决定，关掉 ALL_KMODS 后这些不受影响。
+    # 代价只是镜像里不再附带「全量 kmod 包仓库」，对一次性固件无所谓。
+    - name: Trim ALL_KMODS to fit the 6h job limit
+      run: |
+        cd project/friendlywrt
+        if grep -qx 'CONFIG_ALL_KMODS=y' .config; then
+          sed -i 's/^CONFIG_ALL_KMODS=y/# CONFIG_ALL_KMODS is not set/' .config
+          echo "已关闭 CONFIG_ALL_KMODS，重新 defconfig"
+          make defconfig
+        else
+          echo "CONFIG_ALL_KMODS 本就不在 .config 里，跳过"
+        fi
+        echo "--- 确认 ---"
+        grep -n 'CONFIG_ALL_KMODS' .config || echo "  (无 ALL_KMODS 行)"
+        grep -n 'CONFIG_ALL_NONSHARED' .config || true
+
     - name: Verify customizations survived defconfig
       run: |
         cd project/friendlywrt
         echo "===== 校验关键包是否真的进入了 .config ====="
         fail=0
+        # 注意：adguardhome 本体是预编译二进制注入的，不在 .config 里，
+        # 所以这里只校验 luci-app-adguardhome，不校验 adguardhome。
         for sym in \
             CONFIG_PACKAGE_rtp2httpd \
             CONFIG_PACKAGE_luci-app-rtp2httpd \
-            CONFIG_PACKAGE_adguardhome \
             CONFIG_PACKAGE_luci-app-adguardhome \
             CONFIG_PACKAGE_chrony \
             CONFIG_PACKAGE_luci-app-chrony \
@@ -141,6 +173,13 @@ jobs:
             fail=1
           fi
         done
+        echo "----- 确认 ALL_KMODS 已关闭 -----"
+        if grep -qx 'CONFIG_ALL_KMODS=y' .config; then
+          echo "  MISS CONFIG_ALL_KMODS 仍然是 y，裁剪没生效"
+          fail=1
+        else
+          echo "  OK   CONFIG_ALL_KMODS 已关闭"
+        fi
         echo "----- rtp2httpd feed 是否被 feeds 识别 -----"
         ls -d feeds/rtp2httpd || { echo "  MISS feeds/rtp2httpd"; fail=1; }
         ls feeds/rtp2httpd/openwrt-support 2>/dev/null || true
@@ -415,6 +454,56 @@ jobs:
         echo "--- 注入结果 ---"
         ls -l "${DEST}"
         "${DEST}/caddy" version 2>/dev/null || echo "(arm64 二进制无法在 x86 runner 上执行，属正常)"
+
+    # === 改动 2c：下载 AdGuardHome 官方预编译二进制 ==========================
+    # 不编 adguardhome 包（Go 源码编译太慢），直接取官方 release 的
+    # linux/arm64 静态二进制（自带 Web 前端），放进 rootfs 的 /usr/bin/AdGuardHome。
+    # 运行时文件（init/config/capabilities/sysctl/uci-defaults）已由 overlay 注入。
+    #
+    # 🔴 与 Caddy 的三处不同：
+    #    1) checksums.txt 是 SHA-256（Caddy 是 SHA-512）—— 下面按长度自动选算法
+    #    2) checksums 里文件名带 ./ 前缀（./AdGuardHome_linux_arm64.tar.gz）
+    #    3) 二进制在包内 AdGuardHome/AdGuardHome 子目录，不是顶层
+    - name: Fetch AdGuardHome static binary (linux/arm64)
+      run: |
+        set -e
+        VER="${AGH_VERSION}"
+        TARBALL="AdGuardHome_linux_arm64.tar.gz"
+        BASE="https://github.com/AdguardTeam/AdGuardHome/releases/download/v${VER}"
+        WORK="$(mktemp -d)"
+        cd "${WORK}"
+
+        curl -fSL --retry 5 --retry-delay 3 -o "${TARBALL}" "${BASE}/${TARBALL}"
+        curl -fSL --retry 5 --retry-delay 3 -o checksums.txt "${BASE}/checksums.txt"
+
+        echo "--- 校验哈希 ---"
+        # 兼容 ./ 前缀；只匹配行尾的 tarball 名，避免误配 .sig 等
+        grep -E "(\s)\.?/?${TARBALL}\$" checksums.txt > expected.txt
+        if [ ! -s expected.txt ]; then
+          echo "::error::checksums.txt 中找不到 ${TARBALL} 条目，检查 AGH_VERSION"
+          head -40 checksums.txt
+          exit 1
+        fi
+        HASH_LEN=$(awk '{print length($1)}' expected.txt)
+        case "${HASH_LEN}" in
+          64)  SUM=sha256sum ;;
+          128) SUM=sha512sum ;;
+          *)   echo "::error::无法识别的哈希长度 ${HASH_LEN}"; exit 1 ;;
+        esac
+        echo "使用 ${SUM}（哈希长度 ${HASH_LEN}）"
+        ${SUM} -c expected.txt
+
+        # 二进制在 AdGuardHome/AdGuardHome 子目录
+        tar -xzf "${TARBALL}" "AdGuardHome/AdGuardHome"
+        file AdGuardHome/AdGuardHome || true
+        ldd AdGuardHome/AdGuardHome 2>&1 | grep -q "not a dynamic executable" \
+          || { echo "::error::AdGuardHome 不是静态二进制，拒绝注入"; ldd AdGuardHome/AdGuardHome; exit 1; }
+
+        DEST="${GITHUB_WORKSPACE}/project/device/common/r5s-iptv/usr/bin"
+        mkdir -p "${DEST}"
+        install -m 0755 AdGuardHome/AdGuardHome "${DEST}/AdGuardHome"
+        echo "--- 注入结果 ---"
+        ls -l "${DEST}"
 
     - name: Unpack friendlywrt rootfs
       run: |
